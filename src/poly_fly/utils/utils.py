@@ -46,6 +46,33 @@ class MPC:
     tube_distance: float
     global_planner_step_size: float
     global_planner_robot_radius: float
+    # Kinodynamic RRT-Connect (`global_planner_type: rrt_connect`). These carry defaults so
+    # existing parameter files keep loading unchanged; dictToClass falls back to them.
+    global_planner_type: str = "astar"
+    rrt_steering: str = "minimum_effort"
+    rrt_bound_aware_duration: bool = False
+    rrt_fixed_duration: float = 1.5
+    rrt_rho: float = 30.0
+    rrt_min_duration: float = 1e-2
+    rrt_max_duration: float = 2.0
+    rrt_max_step: float = 0.5
+    rrt_retry_steps: int = 3
+    rrt_goal_bias: float = 0.05
+    rrt_bridge_bias: float = 0.3
+    rrt_bridge_sigma: float = 0.2
+    rrt_max_iterations: int = 20000
+    rrt_timeout: float = 60.0
+    rrt_metric_omega: float = 2.0
+    rrt_collision_step: float = 0.05
+    rrt_check_cable: bool = True
+    rrt_check_quadrotor: bool = True
+    rrt_shortcut_iters: int = 100
+    rrt_sample_vel_fraction: float = 0.3
+    rrt_sample_acc_fraction: float = 0.1
+    rrt_sample_inset: float = 0.2
+    rrt_seed: int = 0
+    rrt_csv_dt: float = 0.02
+    rrt_csv_subdir: str = "rrt"
 
 
 def dictToClass(clss, data):
@@ -299,9 +326,13 @@ def get_yaw_along_trajectory(
     r0_obj = Rot.from_quat([q0[0], q0[1], q0[2], q0[3]])  # (x,y,z,w)
     yaw0, pitch0, roll0 = r0_obj.as_euler('zyx', degrees=False)
 
-    # Keep roll/pitch small requirement; yaw will be corrected
-    if abs(roll0) > 1e-3 or abs(pitch0) > 1e-3:
-        raise ValueError(f"Initial roll/pitch must be ~0. Got roll={roll0}, pitch={pitch0}")
+    # Keep the roll/pitch requirement loose but present, as a guard against a mis-specified
+    # start state. It cannot be tight: a trajectory need not begin at zero jerk. The optimal
+    # planner pins jerk to zero at the first knot, but the RRT-Connect's quintic edges start
+    # with the jerk the boundary value problem demands, which tilts the thrust axis by well
+    # under a degree -- physically negligible, and no indication of a bad initial condition.
+    if abs(roll0) > 0.1 or abs(pitch0) > 0.1:
+        raise ValueError(f"Initial roll/pitch must be small. Got roll={roll0}, pitch={pitch0}")
 
     if zero_initial_yaw:
         # Force initial yaw to zero: apply rotation Δψ = (desired 0) - current yaw = -yaw0

@@ -7,6 +7,9 @@ data/zarr/
 data/depth/
 data/params/forests/*
 !data/params/forests/base.yaml
+# Trajectory CSV output of the RRT-Connect planner lands under data/csvs/ (ignored above),
+# but save_result also writes a params sidecar next to the parameters, so ignore that too.
+data/params/rrt/
 *.egg-info/
 src/poly_fly/controller/c_generated_code
 src/poly_fly/c_generated_code

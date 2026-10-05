@@ -45,4 +45,4 @@ docker run --rm -it \
     -v /usr/local/lib:/usr/local/lib:ro \
     --workdir /workspace \
     "$IMAGE_TAG" \
-    bash -c 'export PYTHONPATH=/workspace:$PYTHONPATH && export PS1="poly_fly@docker:\w$ " && /bin/bash -i'
+    bash -c 'export PYTHONPATH=/workspace/src:$PYTHONPATH && export PS1="poly_fly@docker:\w$ " && /bin/bash -i'

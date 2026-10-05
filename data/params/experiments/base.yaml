@@ -42,3 +42,60 @@ input_max: [10, 10, 10]
 input_min: [-10, -10, -10]
 
 horizon: 100
+
+# --- Global planner selection -----------------------------------------------------------------
+# "astar" uses the 2-D grid search; "rrt_connect" uses the kinodynamic RRT-Connect, whose
+# edges are closed-form quintics between flat states (payload position, velocity, accel).
+global_planner_type: "astar"
+
+# --- Kinodynamic RRT-Connect ------------------------------------------------------------------
+# rrt_steering: "minimum_effort" picks the duration minimising integral(jerk^2) + rho * T;
+#               "fixed" uses rrt_fixed_duration for every edge. Prefer minimum_effort: the
+#               planner's step-limited extensions assume the duration adapts to distance, so
+#               a fixed duration only works well for very short edges.
+# rrt_rho sets how much a second of duration is worth against integral(jerk^2): larger rho ->
+#   shorter, snappier edges; smaller rho -> longer, gentler ones. Lowering it is NOT a way to
+#   cure bound refusals: it shrinks the jerk and acceleration excursions but grows the position
+#   overshoot that a non-zero boundary velocity and acceleration drag along, and measured over
+#   a 200x range of rho the total refusal rate barely moves (91-97%). rrt_bound_aware_duration
+#   is the knob that actually addresses refusals.
+rrt_steering: "minimum_effort"
+# Spend the extra steering time when the minimum-effort duration turns out to break a state or
+#   input limit, searching outward for the nearest admissible duration instead of discarding the
+#   edge. Most refusals are boundary value problems no duration can rescue (only ~7% are), so it
+#   buys a 1.6-1.8x share of admissible edges for a 2.3-2.7x steering cost.
+#   Over the nine mazes (2 seeds, 45 s, plain and aware interleaved so machine load hits both) it
+#   is a wash: 6/18 solved without it, 7/18 with it. What is not a wash is *which* instances
+#   solve -- the two settings succeeded on disjoint hard mazes (it rescues maze_3/4/5, it loses
+#   maze_1 and maze_7), so this is a diversity knob rather than an improvement. Off by default
+#   because it costs strictly more for the same expected solve rate; turn it on if a run has
+#   failed and you want a different draw at it.
+rrt_bound_aware_duration: false
+rrt_fixed_duration: 1.5
+rrt_rho: 30.0
+rrt_min_duration: 0.01
+rrt_max_duration: 2.0
+rrt_max_step: 0.5          # metric step limit per extension; halved on each retry
+rrt_retry_steps: 3
+rrt_goal_bias: 0.05
+# Bridge sampling: drawing near the straight start-goal line is what gets through narrow
+# passages, where uniformly drawn samples essentially never land on an alignment that fits.
+rrt_bridge_bias: 0.3
+rrt_bridge_sigma: 0.2
+rrt_max_iterations: 20000
+rrt_timeout: 60.0
+rrt_metric_omega: 2.0      # trades velocity/accel error against position error in the metric
+rrt_collision_step: 0.05   # metres between collision samples along an edge
+rrt_check_cable: true
+rrt_check_quadrotor: true
+rrt_shortcut_iters: 100
+# Sampling envelope. Shrinking the velocity/acceleration fractions makes the tree explore
+# smoother, more hover-like edges, which is usually what gets through a narrow corridor.
+# rrt_sample_inset keeps this fraction of each position range as headroom, so a quintic's
+# overshoot does not push the payload through state_min/state_max.
+rrt_sample_vel_fraction: 0.3
+rrt_sample_acc_fraction: 0.1
+rrt_sample_inset: 0.2
+rrt_seed: 0
+rrt_csv_dt: 0.02
+rrt_csv_subdir: "rrt"

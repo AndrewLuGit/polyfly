@@ -32,7 +32,12 @@ from scipy.spatial.transform import Rotation as Rot
 
 from poly_fly.optimal_planner.polytopes import Cable, Obs, Polytope, Quadrotor, SquarePayload
 import poly_fly.utils.plot as plotter
-from poly_fly.optimal_planner.global_planner import solve_with_polytopes
+from poly_fly.optimal_planner.global_planner import OpenSetEmptyException, solve_with_polytopes
+from poly_fly.optimal_planner.kinodynamic_rrt_connect import (
+    path_to_sol_values,
+    resample_path_for_initial_guess,
+    solve_with_rrt,
+)
 from poly_fly.utils.utils import (
     MPC,
     dictToClass,
@@ -72,6 +77,9 @@ class Planner:
         self.params = params
         self.plot = plot
         self.global_planner_explored_nodes = None  # Initialize explored nodes storage
+        # Set by get_global_plan when the kinodynamic RRT-Connect ran; the full polynomial
+        # path, used to seed the OCP exactly rather than through linear interpolation.
+        self.global_plan_path = None
         self.libhsl_dir = None
         self.solver = None
 
@@ -256,6 +264,14 @@ class Planner:
             print("No initialization available")
             return
 
+        if self.global_plan_path is not None:
+            # The RRT path is a dynamic trajectory with its own timing. Interpolating its
+            # waypoints on an equal-time grid (the A* branch below) would throw that away, and
+            # the waypoint and query axes there are mismatched by one step besides. Sample the
+            # polynomials directly instead, so the seed is the RRT trajectory itself.
+            self._inject_global_plan()
+            return
+
         time_points = np.linspace(0, self.params.horizon + 1, num_points, endpoint=True)
         interpolated_positions = np.zeros((3, self.params.horizon + 1))
 
@@ -337,6 +353,9 @@ class Planner:
             self.opti.set_initial(self.variables["t"], [0.09] * self.params.horizon)
 
     def get_global_plan(self, plot=False):
+        if getattr(self.params, "global_planner_type", "astar") == "rrt_connect":
+            return self._get_rrt_plan(plot=plot)
+
         result = solve_with_polytopes(self.params, show_animation=plot)
 
         # Handle backward compatibility - check if explored nodes are returned
@@ -359,6 +378,54 @@ class Planner:
             payload_pos_init.append([rx[i], ry[i], 0.0])
 
         return payload_pos_init
+
+    def _get_rrt_plan(self, plot=False):
+        """Kinodynamic RRT-Connect seed: position, velocity and jerk, all dynamically feasible.
+
+        Unlike the A* branch this also fills ``payload_vel_init`` and ``payload_input_init``,
+        and keeps the polynomial path on the planner so ``initialize_variables`` can inject
+        the exact samples instead of re-interpolating them on an equal-time grid.
+        """
+        result = solve_with_rrt(self.params, show_animation=plot)
+        if not result.success:
+            raise OpenSetEmptyException("Kinodynamic RRT-Connect found no path")
+
+        self.global_planner_explored_nodes = np.asarray(result.explored_nodes, dtype=float).reshape(
+            -1, 2
+        )
+        self.global_plan_path = result.path
+
+        positions, velocities, inputs = resample_path_for_initial_guess(result.path, self.params)
+        self.params.payload_pos_init = positions
+        self.params.payload_vel_init = velocities
+        self.params.payload_input_init = inputs
+        return positions
+
+    def _inject_global_plan(self):
+        """Seed the OCP with the exact samples of ``self.global_plan_path``."""
+        horizon = self.params.horizon
+        times = np.linspace(0.0, self.global_plan_path.duration(), horizon + 1)
+
+        # (3, horizon + 1) / (3, horizon), matching the layout the A* branch builds.
+        interpolated_positions = self.global_plan_path.samples_at(times, 0).T
+        interpolated_velocities = self.global_plan_path.samples_at(times, 1).T
+        interpolated_inputs = self.global_plan_path.samples_at(times[:-1], 3).T
+
+        for j in range(horizon + 1):
+            for k in range(3):
+                self.opti.set_initial(self.variables["x"][k, j], interpolated_positions[k, j])
+                self.opti.set_initial(self.variables["x"][k + 3, j], interpolated_velocities[k, j])
+        for j in range(horizon):
+            for k in range(3):
+                self.opti.set_initial(self.variables["u"][k, j], interpolated_inputs[k, j])
+
+        self.interpolated_positions = interpolated_positions
+        self.interpolated_velocities = interpolated_velocities
+        self.interpolated_inputs = interpolated_inputs
+
+        if self.min_time:
+            self.variables["t"] = self.opti.variable(self.params.horizon)
+            self.opti.set_initial(self.variables["t"], [0.09] * self.params.horizon)
 
     def init_opt_vars(self, keys, values):
         for key, value in zip(keys, values):
@@ -450,7 +517,8 @@ class Planner:
             #     self.cost += self.variables["t"][i] * self.params.Q_dt / self.params.horizon
             self.cost += ca.sum1(self.variables["t"]) * self.params.Q_dt / self.params.horizon
 
-    def get_cable_rotation(self, acc_in, symbolic=False):
+    @staticmethod
+    def get_cable_rotation(acc_in, symbolic=False):
         gravity = 9.81
         if symbolic:
             R = ca.MX(3, 3)
@@ -1500,6 +1568,43 @@ def run(
     return total_time, sol_opt, sol_values, iterations, opt_time, path_length
 
 
+def run_rrt(relative_path, plot=True, save=True):
+    """Plan with the kinodynamic RRT-Connect alone: no OCP, no IPOPT, no solver.
+
+    The trajectory it returns is already dynamically feasible, so this is a standalone
+    planner rather than only a warm start for the optimal one. ``--rrt`` on the CLI runs
+    exactly this.
+    """
+    print("------------------------------------")
+    print(f"RRT-Connect {relative_path}")
+    print("------------------------------------")
+    params = dictToClass(MPC, yamlToDict(os.path.join(PARAMS_DIR, relative_path)))
+    params.global_planner_type = "rrt_connect"
+
+    result = solve_with_rrt(params, show_animation=plot)
+    if not result.success:
+        raise OpenSetEmptyException(f"Kinodynamic RRT-Connect found no path for {relative_path}")
+
+    path = result.path
+    print(f"segments: {len(path.motions)}   trajectory duration: {path.duration():.3f} s")
+    print(f"explored nodes: {len(result.explored_nodes)}   wall clock: {result.duration:.3f} s")
+
+    sol_values = path_to_sol_values(path, params)
+    if save:
+        # A distinct stem on purpose: save_all also writes the params sidecar YAML, so reusing
+        # the experiment's own name would overwrite the source parameter file.
+        save_result(os.path.join(params.rrt_csv_subdir, relative_path), params, sol_values)
+    if plot:
+        plotter.plot_result(
+            params,
+            sol_values["x"],
+            sol_values["u"],
+            Planner.differential_flatness,
+            Planner.compute_quadrotor_rotation_matrix_no_jrk,
+        )
+    return sol_values
+
+
 def experiments():
     yamls = [
         "experiments/maze_1.yaml",
@@ -1599,9 +1704,23 @@ if __name__ == "__main__":
         help="Relative path (from PARAMS_DIR) to a single YAML file to solve, "
         "e.g. 'experiments/maze_1.yaml'. If omitted, runs the default experiments().",
     )
+    parser.add_argument(
+        "--rrt",
+        action="store_true",
+        help="Run the kinodynamic RRT-Connect global planner only (no optimization) and "
+        "save its trajectory. Requires --yaml.",
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="With --rrt, draw the trajectory (blocks until the window is closed).",
+    )
     args = parser.parse_args()
 
     if args.yaml is not None:
-        run_single_yaml(args.yaml)
+        if args.rrt:
+            run_rrt(args.yaml, plot=args.plot)
+        else:
+            run_single_yaml(args.yaml)
     else:
         experiments()
