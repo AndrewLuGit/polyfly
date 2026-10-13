@@ -49,6 +49,14 @@ horizon: 100
 global_planner_type: "astar"
 
 # --- Kinodynamic RRT-Connect ------------------------------------------------------------------
+# Tuned on mazes 1-9, four seeds each (2026-10-12): the values below plan 36/36 instances, median
+#   2.2 s of planning and a 10.1 s / 8.2 m median trajectory, against 4/36 and a 76.8 s median
+#   trajectory for the previous settings, measured wall clock back-to-back in one session. The
+#   tuned configuration's worst instance was 18.5 s.
+# Planning time here is wall clock and this host's throughput swings several-fold between
+#   sessions, so the search parameters were screened with an *iteration budget* instead
+#   (`rrt_max_iterations` set, `rrt_timeout` huge), which is load-independent because the search
+#   is deterministic for a fixed seed; only the final A/B used the clock.
 # rrt_steering: "minimum_effort" picks the duration minimising integral(jerk^2) + rho * T;
 #               "fixed" uses rrt_fixed_duration for every edge. Prefer minimum_effort: the
 #               planner's step-limited extensions assume the duration adapts to distance, so
@@ -63,39 +71,145 @@ rrt_steering: "minimum_effort"
 # Spend the extra steering time when the minimum-effort duration turns out to break a state or
 #   input limit, searching outward for the nearest admissible duration instead of discarding the
 #   edge. Most refusals are boundary value problems no duration can rescue (only ~7% are), so it
-#   buys a 1.6-1.8x share of admissible edges for a 2.3-2.7x steering cost.
-#   Over the nine mazes (2 seeds, 45 s, plain and aware interleaved so machine load hits both) it
-#   is a wash: 6/18 solved without it, 7/18 with it. What is not a wash is *which* instances
-#   solve -- the two settings succeeded on disjoint hard mazes (it rescues maze_3/4/5, it loses
-#   maze_1 and maze_7), so this is a diversity knob rather than an improvement. Off by default
-#   because it costs strictly more for the same expected solve rate; turn it on if a run has
-#   failed and you want a different draw at it.
+#   buys a 1.6-1.8x share of admissible edges for a 2.3-2.7x steering cost. With the small
+#   sampling envelope below the refusal rate is already low, and over mazes 1-9 x 4 seeds at
+#   rho 100 it measured identical to plain steering (36/36 either way, same median iterations,
+#   same trajectories), so it is off. Keep it as a diversity knob for a run that has already
+#   failed: it succeeds on a different draw, not on more instances.
 rrt_bound_aware_duration: false
+# Nearest-neighbour metric. "euclidean" weights velocity and acceleration against position
+#   (rrt_metric_omega) and is the measured best here. "duration" ranks by the minimum-effort
+#   duration of the edge a node would fly, so a node that is far away but already moving the
+#   right way reads as close. Every node in the tree needs a root solve, ~130x the per-query
+#   cost, so it is slower per query as well.
+#   Measured over {wall, maze_1, maze_9} x 2 seeds at 60 s, interleaved: "duration" solved
+#   3/6 against 4/6, and needed 3.6x the nodes on the instances both solved (maze_9: 3341 and
+#   2112 nodes against 448 and 472). It is not a cost problem -- the shorter, more often valid
+#   prefixes it picks mean it runs slightly *more* iterations per second than euclidean. It
+#   loses on search quality: always extending from the node that can reach fastest is greedy,
+#   and it trades away the spatial coverage the mazes need. Off by default for that reason.
+rrt_metric: "euclidean"
+# Which tree takes the random sample each iteration; the other one gets the greedy CONNECT
+#   walk toward the new node. "larger" grows the bigger tree -- fastest of the three on the
+#   sanity suite's wall scenario, where the goal sits in open space -- but it deadlocks on this
+#   suite: when the goal tree is the one that cannot grow (a goal in a pocket a straight quintic
+#   cannot leave), it stays the larger tree forever, the start tree only ever gets CONNECT walks
+#   and never a sample, and no iteration can recover. Measured on maze_2: 2 nodes after 2000 and
+#   after 3000 iterations, every candidate edge steered from the goal root; on maze_1 the start
+#   tree held 1 node while the goal tree reached 1685, and 0 of 60 sampled goal-tree targets
+#   admitted an extension from the start root. "alternate" gives each tree every second iteration
+#   and solves both instances in about a second. "ratio" is VAMP-RRTC's balance rule -- swap
+#   unless the current tree is already smaller than rrt_tree_ratio of the other -- and also
+#   alternates at equal sizes; it behaves like "alternate" here but explores a little differently.
+rrt_tree_selection: "alternate"
+rrt_tree_ratio: 0.5
+# Dynamic domain, from VAMP-RRTC: a sample landing farther than the nearest node's radius
+#   is dropped before any steering, and the radius shrinks on refusal and grows on success,
+#   so nodes in dead ends stop attracting samples. Radii are multiples of rrt_max_step, which
+#   used to mean metric units and now means a time -- the radius is compared against a metric
+#   distance, so treat rrt_dd_radius as carrying whatever units the active metric uses;
+#   VAMP's own defaults are radius = 2x range and min_radius = 0.5x range, with a very
+#   small alpha that makes the adaptation slow and the radius close to static.
+#   It measured positive against the older sampling defaults, but with the small envelope below
+#   almost no sample is worth dropping before steering, and on mazes 1-9 it measured neutral
+#   (same solve rate, same iterations to solve, same trajectories), so it is off. It never
+#   rescues a run that the settings below fail.
+rrt_dynamic_domain: false
+rrt_dd_alpha: 1.0e-4
+rrt_dd_radius: 2.0
+rrt_dd_min_radius: 0.5
 rrt_fixed_duration: 1.5
-rrt_rho: 30.0
+# 100 (up from 30) shortens the median trajectory by ~11% at the same solve rate -- over mazes
+#   1-9 x 4 seeds, 10.7 s against 12.0 s, with a slightly better plan-time tail. Going to 300
+#   loses the search (9/18): the faster edges sit closer to the acceleration and input limits and
+#   are refused more often. The floor matters too: a trajectory's duration is one minimum-effort
+#   duration per edge, so rho is the only knob that speeds up an already-found path.
+rrt_rho: 100.0
 rrt_min_duration: 0.01
 rrt_max_duration: 2.0
-rrt_max_step: 0.5          # metric step limit per extension; halved on each retry
-rrt_retry_steps: 3
+# Extension step, in seconds of flight: each growth of a tree takes at most this much of the
+#   motion toward its target, and the step is halved on each retry. A time rather than a metric
+#   distance because the duration a minimum-effort quintic takes is only a cube-root function
+#   of the distance it covers (~2.2 * d^(1/3) s on this payload), so a metric step bought a
+#   wildly varying amount of motion. The value matters more than the unit: interleaved
+#   {wall, maze_1, maze_9} seed 0 at 45 s, the whole search fails at 1.0 s on all three,
+#   while 2.5 s solves all three and is the fastest of every setting tried on maze_1 and
+#   maze_9 (6.5 s and 4.0 s against 12.6 s and 5.1 s for the metric step). The wall is the
+#   exception and prefers the metric step (8.3 s against 15.1 s). 2.5 s is close to the
+#   2.7 s the effort optimum saturates at, so the limit only binds on the longest edges --
+#   setting it past ~3 s is the same as disabling it, which measures as a different search
+#   again (maze_9 solves in 0.2 s from one direct edge, maze_1 does not solve at all).
+rrt_max_step: 2.5
+# Retries per extension, each halving the step. One retry at the full step is measured best on
+#   the mazes: with the small envelope most refusals mean the whole corridor is blocked rather
+#   than the step being long, and every retry pays a fresh boundary value problem. On the hard
+#   subset (mazes 3/4/5/6/8 x 2 seeds) three retries solved 8/10 against 10/10 for one, at 5x
+#   the median planning time (30.6 s and 2356 iterations against 6.1 s and 819).
+rrt_retry_steps: 1
+# Intermediate states, as in OMPL's control RRT (control/planners/rrt): when positive, every
+#   state along an accepted extension spaced this many seconds apart joins the tree as its own
+#   node, each storing the piece of the motion that arrives at it, so nearest-neighbour queries
+#   resolve at this spacing instead of one node per extension. 0 keeps one node per extension.
+#   On the hard subset it did solve 10/10, but at 40x the iterations of the same configuration
+#   with 0 (median 10576 against 225) and 6x the time; it also needs rrt_shortcut_iters raised
+#   with it, because every intermediate hop is re-solved as its own minimum-effort edge when the
+#   goal tree is walked (193 such hops once gave a 137 s path that a 100-iteration budget could
+#   not touch). Off by default for both reasons.
+rrt_intermediate_dt: 0.0
+# Draw the goal itself this fraction of the time. 0.05 is a mild pull that helps the final
+#   approach; 0.2 measured worse over mazes 1-9 x 3 seeds (25/27 against 27/27), because the
+#   goal tree then spends too many of its own samples on a state it already holds.
 rrt_goal_bias: 0.05
 # Bridge sampling: drawing near the straight start-goal line is what gets through narrow
 # passages, where uniformly drawn samples essentially never land on an alignment that fits.
-rrt_bridge_bias: 0.3
+#   The value is a compromise -- the line only helps where the route follows it, and on a
+#   chicane it is wasted samples. Measured over mazes 1-9 x 5 seeds (8000-iteration budget)
+#   and then mazes 6-7 x 10 seeds (20 000), all at the envelope and rho below:
+#     0.0   44/45 and 18/20. Fastest when it solves, but two maze_7 seeds exhausted 20 000
+#           iterations, and its median trajectory runs ~10% longer.
+#     0.2   44/45 and 20/20. Best plan-time tail (p90 7.3 s) and the shortest median
+#           trajectory (9.4 s); this is the chosen value.
+#     0.3   45/45 and 18/20. Its apparent trajectory advantage at 45 runs disappears in a
+#           paired per-instance comparison (0.0 is the shorter path on 19 of 44), and it costs
+#           a median 17 s on maze_7 against 5 s at 0.2. Not worth the planning time.
+#     0.5   40/45 and 1/5 on maze_7. The straight line from (0,-1,0) to (2,-1,0) runs under a
+#           wall, so half the samples land where the cable cannot go.
+rrt_bridge_bias: 0.2
 rrt_bridge_sigma: 0.2
-rrt_max_iterations: 20000
-rrt_timeout: 60.0
+rrt_max_iterations: 2000000
+rrt_timeout: 120.0
 rrt_metric_omega: 2.0      # trades velocity/accel error against position error in the metric
+# The checker takes min(rrt_collision_step, 0.25 * smallest obstacle half-extent), so on these
+#   mazes (0.2 m walls plus the 0.1 margin) it can only ever be tightened below 0.05, never
+#   loosened -- raising it changes nothing.
 rrt_collision_step: 0.05   # metres between collision samples along an edge
 rrt_check_cable: true
 rrt_check_quadrotor: true
-rrt_shortcut_iters: 100
-# Sampling envelope. Shrinking the velocity/acceleration fractions makes the tree explore
-# smoother, more hover-like edges, which is usually what gets through a narrow corridor.
+# Greedy shortcutting budget. The path is one minimum-effort edge per accepted extension, so a
+#   raw path has 10-30 motions and the greedy pass converges in fewer than 100 tries; measured
+#   identical paths at 100, 400, 2000 and 6000, so the budget only binds on an unusually long
+#   path. It cannot fix a meandering route: merging is only possible between states a single
+#   quintic can join without leaving free space.
+rrt_shortcut_iters: 400
+# Sampling envelope. The velocity/acceleration ranges are this fraction of the state limits, and
+# they are the strongest knobs on the solve rate: they set how much of the tree is spent on edges
+# a quintic can actually fly. A near-hover tree is what threads a wall gap with a
+# cable-suspended payload -- the cable's tilt follows the payload's acceleration, so a large
+# sampled acceleration swings the quadrotor into walls the payload itself would clear. Measured
+# on the hard subset (mazes 3/4/5/6/8 x 2 seeds, 8000-iteration budget): fractions 1.0/1.0 solve
+# 2/10, 0.1/0.03 solve 10/10, 0.05/0.01 solve 10/10 faster, and 0.02/0.005 is the fastest and
+# the only setting that solves every maze_7 seed (maze_7 is the hardest instance: a 0.2 m slot
+# under a wall the cable has to thread). The price is trajectory duration -- near-rest states
+# make every edge a gentle boundary value problem -- which is what rrt_rho above is raised for.
 # rrt_sample_inset keeps this fraction of each position range as headroom, so a quintic's
-# overshoot does not push the payload through state_min/state_max.
-rrt_sample_vel_fraction: 0.3
-rrt_sample_acc_fraction: 0.1
-rrt_sample_inset: 0.2
+# overshoot does not push the payload through state_min/state_max. Leave it at 0.0 on this
+# suite: the RRT can only extend toward sampled states, so a route that has to leave the
+# shrunken box is unfindable rather than merely slow. maze_1 must clear a wall at |y| > 1.2,
+# and inset 0.2 on y in [-2, 2] puts the box edge exactly there -- 40 000 iterations and
+# 21 626 nodes found nothing, against a 1.1 s solve at 0.0.
+rrt_sample_vel_fraction: 0.02
+rrt_sample_acc_fraction: 0.005
+rrt_sample_inset: 0.0
 rrt_seed: 0
 rrt_csv_dt: 0.02
 rrt_csv_subdir: "rrt"

@@ -1713,7 +1713,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--plot",
         action="store_true",
-        help="With --rrt, draw the trajectory (blocks until the window is closed).",
+        help="With --rrt, draw the search trees and the trajectory (blocks until the window is closed).",
     )
     args = parser.parse_args()
 

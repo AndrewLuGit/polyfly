@@ -39,6 +39,7 @@ from poly_fly.optimal_planner.kinodynamic_rrt_connect import (  # noqa: E402
     _end_derivatives_inverse,
     _mobility_for,
     is_motion_within_bounds,
+    make_metric,
     make_steering,
     path_to_sol_values,
     poly_extrema,
@@ -430,6 +431,75 @@ def main():
         if full != quick:
             mismatched += 1
     check("early-exit bounds check agrees with the full score", mismatched == 0)
+
+    # 20. effort_numerator must be the integral of the squared jerk, not merely some positive
+    # quadratic form. Check 5 cannot see this: FlatMotion.cost recomputes the coefficients
+    # from scratch, so a weight matrix that coupled *different axes* slipped past it -- and
+    # inflated Q by up to 1.9x on random boundary value problems, which silently re-tuned
+    # every "minimum-effort" duration in the planner.
+    worst = 0.0
+    for _ in range(60):
+        f = rng.normal(0, 1, (ORDER, OUTPUT_DIM))
+        t = rng.normal(0, 1, (ORDER, OUTPUT_DIM))
+        T = rng.uniform(0.3, 4.0)
+        motion = FlatMotion(fixed.coefficients_over(f, t, T), T)
+        times = np.linspace(0, T, 200001)
+        numeric = np.trapezoid((motion.samples_at(times, ORDER) ** 2).sum(axis=1), times)
+        analytic = float(np.polyval(plain.effort_numerator(f, t)[::-1], T)) / T**5
+        worst = max(worst, abs(analytic - numeric) / max(numeric, 1e-9))
+    check("effort_numerator is the jerk integral", worst < 1e-6, "rel err %.1e" % worst)
+
+    # 21. the batch duration solve that the duration metric ranks with must agree with the
+    # exact root solver the steerer uses. It brackets by scan rather than Newton, so this is
+    # really a check that the bracket holds: a missed sign change lands at order 1, not at
+    # the 1e-3 the bisection itself delivers.
+    p0 = rng.normal(0, 1, (ORDER, OUTPUT_DIM))
+    scale9 = np.array([1.5, 1.5, 0.4, 0.8, 0.8, 0.8, 0.4, 0.4, 0.4])
+    batch_targets = np.vstack([rng.normal(0, 1, 9) * scale9 for _ in range(300)])
+    batch = plain.optimal_duration_batch(p0, batch_targets)
+    worst = 0.0
+    missed = 0
+    for state, got in zip(batch_targets, batch):
+        exact = plain.optimal_duration(p0, state.reshape(ORDER, OUTPUT_DIM))
+        if exact is None:
+            continue
+        relative = abs(got - exact[0]) / exact[0]
+        worst = max(worst, relative)
+        if relative > 1e-2:
+            missed += 1
+    check(
+        "batched duration agrees with the exact solver",
+        missed == 0,
+        "max rel err %.1e, %d of %d over 1%%" % (worst, missed, len(batch)),
+    )
+
+    # 22. the duration metric must pick the node the exact steering would pick, and must
+    # refuse to be paired with a steerer that has no duration to rank by.
+    params.rrt_metric = "duration"
+    duration_metric = make_metric(params, plain)
+    geometry = np.vstack([rng.normal(0, 1, 9) * scale9 for _ in range(40)])
+    target = rng.normal(0, 1, 9) * scale9
+    rows = target.reshape(ORDER, OUTPUT_DIM)
+    # node -> target, the direction the edge would be flown: the duration is not symmetric,
+    # so ranking by the reverse is a different (and wrong) ordering.
+    exact = [plain.optimal_duration(s.reshape(ORDER, OUTPUT_DIM), rows) for s in geometry]
+    usable = [value[0] for value in exact if value is not None]
+    picked = duration_metric.nearest(geometry, target)
+    picked_value = exact[picked][0] if exact[picked] is not None else float("inf")
+    # Not equality with the exact argmin: the batch solve is bisection-accurate, so two
+    # near-tied nodes may swap. Being within a percent of the best duration is the contract.
+    check(
+        "duration metric's nearest is the exact-duration argmin",
+        bool(usable) and (picked_value - min(usable)) / min(usable) < 1e-2,
+        "picked %.4f vs best %.4f" % (picked_value, min(usable)),
+    )
+    refused = False
+    try:
+        make_metric(params, FixedDurationSteering(duration=1.5))
+    except ValueError:
+        refused = True
+    params.rrt_metric = "euclidean"
+    check("duration metric refuses the fixed steerer", refused)
 
     print("\nAll %d checks passed." % len(RESULTS))
 

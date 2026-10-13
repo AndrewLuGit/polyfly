@@ -45,6 +45,10 @@ GRAVITY = 9.81
 ACC_NORM_EPS = 1.0
 
 TRAPPED, ADVANCED, REACHED = 0, 1, 2
+# The sample fell outside the nearest node's dynamic domain, so nothing was attempted.
+# Distinct from TRAPPED so the failure bookkeeping does not blame the node for a
+# rejection that never reached it.
+REJECTED = 3
 
 # Bound-aware duration search: multiplicative offsets from the minimum-effort duration,
 # ordered by how far they move it so the mildest admissible duration is found first. Ratio
@@ -52,6 +56,35 @@ TRAPPED, ADVANCED, REACHED = 0, 1, 2
 # suite; going finer costs steering time on the ~85% of boundary value problems that turn
 # out to have no admissible duration at any of them.
 BOUND_AWARE_DURATION_FACTORS = (1.3, 0.769, 1.69, 0.592, 2.197, 0.455, 2.856, 0.35)
+
+# Ceiling for the batch duration solve. Well past any edge the planner will ever consider
+# (the search is bounded by `rrt_timeout` in seconds); it exists only to keep a diverging
+# bracket from overflowing T^6.
+_BATCH_MAX_DURATION = 1e3
+
+# Bracketing scan for the batch duration solve: geometric offsets from the closed-form
+# start, then bisection inside the sign change. The optimum sits inside a factor of two of
+# that start on the maze distribution, but the ladder reaches 0.25x-8x so that a boundary
+# value problem far from the three single-mechanism regimes still brackets. Eight
+# bisections buy 1e-3 relative, which is far more than a ranking needs.
+_BATCH_LADDER = 2.0 ** np.arange(-2, 4)
+_BATCH_BISECTIONS = 8
+
+# The effort cost Q(T) = integral_0^1 ||jerk(tau)||^2 dtau is a quadratic form
+#     Q(T) = sum_{i,j} U[i,j] * <g_i(T), g_j(T)>,     U[i,j] = 1/(i+j+1),
+# where g_i is the tau-polynomial for d_{i+3} over the three axes and <.,.> sums over
+# axes only. Q is degree 2k-2 = 4 in T, and its coefficients are the (p, r) "power"
+# products below.
+#
+# `_EFFORT_WEIGHT` carries the 1/(i+j+1) weight; the kronecker structure with the
+# identity is what keeps the pairing *within* an axis. Without it the weight also
+# couples, say, g_3's x-component to g_4's y-component, and Q stops being the integral
+# of the squared norm -- measured against a numerical integral, that inflated it by up
+# to 1.9x on random BVPs, which silently re-tuned every "minimum-effort" duration.
+_EFFORT_ORDER = np.arange(ORDER)
+_EFFORT_U = 1.0 / (_EFFORT_ORDER[:, None] + _EFFORT_ORDER[None, :] + 1.0)
+_EFFORT_WEIGHT = np.kron(_EFFORT_U, np.eye(OUTPUT_DIM))
+_EFFORT_SCALE = (3.0, 12.0, 30.0)  # (6, 24, 60) / 2
 
 
 # --------------------------------------------------------------------------------------
@@ -170,6 +203,24 @@ class FlatMotion:
         if duration > self.duration + 1e-12:
             raise ValueError(f"cannot extend motion to {duration} > {self.duration}")
         return FlatMotion(self.coefficients, min(duration, self.duration))
+
+    def slice(self, start: float, end: float) -> "FlatMotion":
+        """The interior piece over ``[start, end]``, re-based so its own time 0 is ``start``.
+
+        A Taylor shift of the coefficients, so the piece is the *same* trajectory seen from
+        ``start`` rather than a fresh solution between the two states. Intermediate-state
+        chains store one piece per hop, and this is what makes their concatenation
+        reproduce the edge the steerer validated instead of re-solving it.
+        """
+        if not (0.0 <= start < end <= self.duration + 1e-12):
+            raise ValueError(f"slice [{start}, {end}] is not inside [0, {self.duration}]")
+        end = min(end, self.duration)
+        rows = self.coefficients.shape[0]
+        shifted = np.zeros_like(self.coefficients)
+        for i in range(rows):
+            for k in range(i, rows):
+                shifted[i] += self.coefficients[k] * math.comb(k, i) * start ** (k - i)
+        return FlatMotion(shifted, end - start)
 
     def derivative(self) -> "FlatMotion":
         coeffs = _derivative_coefficients(self.coefficients, 1)
@@ -368,6 +419,145 @@ class FixedDurationSteering(FlatSteering):
         return self.duration
 
 
+def _effort_q_coefficients(froms: np.ndarray, tos: np.ndarray) -> np.ndarray:
+    """Ascending coefficients of ``Q(T)`` for a batch of boundary value problems.
+
+    ``froms`` and ``tos`` are both ``(N, 3, 3)`` row-per-derivative states. Every row is an
+    independent problem, which is what lets the search rank by the duration of the edge it
+    would actually fly (node -> target) rather than by the reverse -- the duration is not
+    symmetric, and on a state moving toward the target the two can differ by a factor.
+    Returns ``(N, 2k)``, with the coefficients above degree ``2k-2`` zero.
+    """
+    p0, v0, a0 = froms[:, 0], froms[:, 1], froms[:, 2]
+    p1, v1, a1 = tos[:, 0], tos[:, 1], tos[:, 2]
+    dp = p1 - p0
+
+    # A[i][p] is the (N, 3) axis vector multiplying T^p in the numerator of d_{i+3},
+    # carrying the 6/24/60 that turns d into g. Kept as separate contiguous arrays: the
+    # same numbers inside one (N, 9, 3) block are reachable only through strided slices,
+    # and on this workload a strided write costs more than the arithmetic it feeds.
+    blocks = (
+        (
+            _EFFORT_SCALE[0] * 20.0 * dp,
+            _EFFORT_SCALE[0] * -(8.0 * v1 + 12.0 * v0),
+            _EFFORT_SCALE[0] * -(3.0 * a0 - a1),
+        ),
+        (
+            _EFFORT_SCALE[1] * -30.0 * dp,
+            _EFFORT_SCALE[1] * (14.0 * v1 + 16.0 * v0),
+            _EFFORT_SCALE[1] * (3.0 * a0 - 2.0 * a1),
+        ),
+        (
+            _EFFORT_SCALE[2] * 12.0 * dp,
+            _EFFORT_SCALE[2] * -(6.0 * v1 + 6.0 * v0),
+            _EFFORT_SCALE[2] * (a1 - a0),
+        ),
+    )
+    # d[p] is (N, 9) over alpha = block * 3 + axis, matching `_EFFORT_WEIGHT`.
+    d = [
+        np.concatenate([blocks[0][p], blocks[1][p], blocks[2][p]], axis=1)
+        for p in range(ORDER)
+    ]
+    # q_m = sum_{p + r = m} d[p] . (_EFFORT_WEIGHT @ d[r]), the axis dot falling out of
+    # the sum over alpha. Only the upper triangle of (p, r) is walked: the form is
+    # symmetric, so the mirrored pairs contribute an equal amount -- which on this
+    # workload saves three of the nine reductions.
+    weighted = [block @ _EFFORT_WEIGHT.T for block in d]
+    parts: List[Optional[np.ndarray]] = [None] * (2 * ORDER - 1)
+    for p in range(ORDER):
+        for r in range(p, ORDER):
+            term = (d[p] * weighted[r]).sum(axis=1)
+            if r != p:
+                term = term + term
+            m = p + r
+            parts[m] = term if parts[m] is None else parts[m] + term
+    return np.stack(parts, axis=1)
+
+
+def _batch_q_coefficients(from_rows: np.ndarray, tos: np.ndarray) -> np.ndarray:
+    """``_effort_q_coefficients`` with one fixed origin and many targets.
+
+    ``from_rows`` is a single flat state in row-per-derivative form, ``tos`` an ``(N, 9)``
+    array of flat states.
+    """
+    tos = np.asarray(tos, dtype=float).reshape(-1, N_STATES)
+    froms = np.broadcast_to(
+        np.asarray(from_rows, dtype=float), (tos.shape[0], ORDER, OUTPUT_DIM)
+    )
+    return _effort_q_coefficients(froms, tos.reshape(-1, ORDER, OUTPUT_DIM))
+
+
+def _duration_start_guess(froms: np.ndarray, tos: np.ndarray, rho: float, floor: float):
+    """Closed-form optima of the three single-mechanism problems, as a bracket centre.
+
+    The position term dominates whenever there is ground to cover; the other two exist so
+    that the start does not collapse to zero on a pure velocity or acceleration change,
+    where the position formula degenerates.
+    """
+    dp = tos[:, 0] - froms[:, 0]
+    dv = tos[:, 1] - froms[:, 1]
+    da = tos[:, 2] - froms[:, 2]
+    return np.maximum.reduce(
+        (
+            (3600.0 * (dp * dp).sum(axis=1) / rho) ** (1.0 / 6.0),
+            (576.0 * (dv * dv).sum(axis=1) / rho) ** (1.0 / 5.0),
+            np.sqrt(6.0 * (da * da).sum(axis=1) / rho),
+            np.full(froms.shape[0], floor),
+        )
+    )
+
+
+def _horner_batch_2d(coefficients: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Horner for one polynomial per row against many ``t``: (N, deg+1) x (N, M) -> (N, M)."""
+    total = coefficients[:, -1][:, None] * np.ones_like(t)
+    for index in range(coefficients.shape[1] - 2, -1, -1):
+        total = total * t + coefficients[:, index][:, None]
+    return total
+
+
+def _first_positive_root(slope: np.ndarray, guess: np.ndarray, lower: float) -> np.ndarray:
+    """Smallest positive root of each row of ``slope``, by bracketing then bisection.
+
+    Newton is deliberately not used. ``S`` is not monotone, and on a sizeable minority of
+    boundary value problems the closed-form start lands where ``S`` is *decreasing*, from
+    which Newton walks away from the root rather than toward it: measured over 400 random
+    pairs it missed by more than 1% on 11.5% of them, and more iterations made it worse
+    (the damping crawled to the floor) rather than better.
+
+    The smallest root is the one wanted -- ``J`` diverges at both ends, and where a second
+    local minimum exists at all it prices at over 100x the first on this state
+    distribution -- so the scan looks for the *first* sign change from below zero, which
+    bisection then narrows.
+    """
+    rows = np.arange(slope.shape[0])
+    ladder = np.clip(guess[:, None] * _BATCH_LADDER[None, :], lower, _BATCH_MAX_DURATION)
+    values = _horner_batch_2d(slope, ladder)
+    above = values > 0.0
+    index = np.argmax(above, axis=1)
+    found = above[rows, index]
+    high = np.where(found, ladder[rows, index], ladder[:, -1])
+    low = np.where(
+        found & (index > 0), ladder[rows, np.maximum(index - 1, 0)], np.full(len(rows), lower)
+    )
+    for _ in range(_BATCH_BISECTIONS):
+        middle = 0.5 * (low + high)
+        below = _horner_batch(slope, middle) <= 0.0
+        low = np.where(below, middle, low)
+        high = np.where(below, high, middle)
+    # A row whose ladder never turns positive keeps the top of the ladder: it is a
+    # boundary value problem whose optimum lies beyond 16x the closed-form start, which in
+    # practice means a nearly degenerate one. Erring large only makes it rank as far away.
+    return np.where(found, 0.5 * (low + high), ladder[:, -1])
+
+
+def _horner_batch(coefficients: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Horner evaluation of one polynomial per row: ``coefficients`` is (N, degree+1)."""
+    total = coefficients[:, -1] * np.ones_like(t)
+    for index in range(coefficients.shape[1] - 2, -1, -1):
+        total = total * t + coefficients[:, index]
+    return total
+
+
 class MinimumEffortSteering(FlatSteering):
     """Picks the duration minimising ``J(T) = Q(T)/T^(2k-1) + rho*T``.
 
@@ -392,46 +582,16 @@ class MinimumEffortSteering(FlatSteering):
         self.rho = float(rho)
 
     def effort_numerator(self, from_: np.ndarray, to: np.ndarray) -> np.ndarray:
-        """Ascending coefficients of ``Q(T)``, length ``2k``."""
+        """Ascending coefficients of ``Q(T)``, length ``2k``.
+
+        Per axis, the top-k coefficients of the tau-normalized polynomial as polynomials
+        in T. For k == 3 (verified against a brute-force scan) these are
+          d3 = ( 20dp - (8v1 + 12v0)T - (3a0 -  a1)T^2 ) / 2
+          d4 = (-30dp + (14v1 + 16v0)T + (3a0 - 2a1)T^2 ) / 2
+          d5 = ( 12dp -   6(v1 + v0)T + (a1 -  a0)T^2 ) / 2
+        """
         from_, to = self._check_states(from_, to)
-        k = self.order
-        n_terms = 2 * k
-
-        # Per axis, the top-k coefficients of the tau-normalized polynomial as polynomials
-        # in T. For k == 3 (verified against a brute-force scan) these are
-        #   d3 = ( 20dp - (8v1 + 12v0)T - (3a0 -  a1)T^2 ) / 2
-        #   d4 = (-30dp + (14v1 + 16v0)T + (3a0 - 2a1)T^2 ) / 2
-        #   d5 = ( 12dp -   6(v1 + v0)T + (a1 -  a0)T^2 ) / 2
-        p0, v0, a0 = from_[0], from_[1], from_[2]
-        p1, v1, a1 = to[0], to[1], to[2]
-        dp = p1 - p0
-
-        # Numerator coefficients (ascending in T) of d3, d4, d5, one entry per axis. Written
-        # out with direct assignment rather than np.stack/concatenate: this function runs on
-        # every steering call and the array-construction overhead dominated it.
-        terms3 = (20.0 * dp, -(8.0 * v1 + 12.0 * v0), -(3.0 * a0 - a1))
-        terms4 = (-30.0 * dp, (14.0 * v1 + 16.0 * v0), (3.0 * a0 - 2.0 * a1))
-        terms5 = (12.0 * dp, -(6.0 * v1 + 6.0 * v0), (a1 - a0))
-
-        # Rows are (k, axis); columns are powers of T. g_k = 6 * d3, 24 * d4, 60 * d5 for
-        # k = 0, 1, 2, and d_k = numerator / 2.
-        flat = np.empty((k * OUTPUT_DIM, 3))
-        for block, scale, terms in ((0, 3.0, terms3), (1, 12.0, terms4), (2, 30.0, terms5)):
-            for power in range(3):
-                flat[block * OUTPUT_DIM : (block + 1) * OUTPUT_DIM, power] = scale * terms[power]
-
-        # Q = sum_{k,l} (1/(k+l+1)) * sum_axis conv(g_k, g_l). Nine outer products of
-        # length-9 vectors cover every (k, axis) x (l, axis) pair at once.
-        conv = np.zeros((k * OUTPUT_DIM, k * OUTPUT_DIM, 5))
-        for p in range(3):
-            for other in range(3):
-                conv[:, :, p + other] += np.outer(flat[:, p], flat[:, other])
-
-        orders = np.repeat(np.arange(k), OUTPUT_DIM)
-        weights = 1.0 / (orders[:, None] + orders[None, :] + 1)
-        q = np.zeros(n_terms)
-        q[:5] = (conv * weights[:, :, None]).sum(axis=(0, 1))
-        return q
+        return _batch_q_coefficients(from_, to.reshape(1, N_STATES))[0]
 
     def optimal_duration(self, from_: np.ndarray, to: np.ndarray) -> Optional[Tuple[float, float]]:
         """Returns ``(T*, J(T*))`` or ``None`` when no finite optimum exists."""
@@ -469,6 +629,42 @@ class MinimumEffortSteering(FlatSteering):
             if best is None or c < best[1]:
                 best = (T, c)
         return best
+
+    def optimal_duration_batch(self, from_: np.ndarray, tos: np.ndarray) -> np.ndarray:
+        """Minimum-effort durations for many targets at once.
+
+        ``S(T) = T*Q'(T) - (2k-1)*Q(T) + rho*T^(2k)`` is the numerator of ``J'``, so its
+        smallest positive root is the optimal duration. The bracket comes from the
+        closed-form optima of the three single-mechanism problems; see
+        ``_first_positive_root`` for why the root is bracketed rather than Newton-solved.
+
+        Deliberately *not* clipped to ``max_duration``: the effort optimum on this hardware
+        sits around 2.7 s, above the configured 2.0 s, so clamping would saturate most of
+        the ranking at the ceiling and destroy the ordering this exists to provide.
+
+        This feeds a nearest-neighbour ranking, not a trajectory, so the exact root solver
+        stays the one that shapes edges. The sanity suite measures the agreement.
+        """
+        tos = np.asarray(tos, dtype=float).reshape(-1, N_STATES)
+        n = tos.shape[0]
+        froms = np.broadcast_to(np.asarray(from_, dtype=float), (n, ORDER, OUTPUT_DIM))
+        return self.durations_between(froms, tos.reshape(n, ORDER, OUTPUT_DIM))
+
+    def durations_between(self, froms: np.ndarray, tos: np.ndarray) -> np.ndarray:
+        """Optimal durations for a batch of independent boundary value problems.
+
+        ``froms`` and ``tos`` are both ``(N, 3, 3)`` row-per-derivative states, so the
+        origin may vary per row -- which is what the nearest-neighbour scan needs.
+        """
+        k = self.order
+        n = froms.shape[0]
+        q = _effort_q_coefficients(froms, tos)
+        slope = np.zeros((n, 2 * k + 1))
+        for m in range(2 * k - 1):
+            slope[:, m] = (m + 1 - 2 * k) * q[:, m]
+        slope[:, 2 * k] = self.rho
+        guess = _duration_start_guess(froms, tos, self.rho, self.min_duration)
+        return _first_positive_root(slope, guess, self.min_duration)
 
     def _duration(self, from_: np.ndarray, to: np.ndarray) -> Optional[float]:
         optimum = self.optimal_duration(from_, to)
@@ -1044,11 +1240,83 @@ def is_motion_within_bounds(motion: FlatMotion, params) -> bool:
 # --------------------------------------------------------------------------------------
 # RRT-Connect
 # --------------------------------------------------------------------------------------
+class _WeightedEuclidean:
+    """Position in metres, velocity and acceleration scaled by 1/omega.
+
+    ``omega`` defaults to the payload pendulum's natural frequency ``sqrt(g/L)``, which
+    prices a velocity error the way it shows up as a position error at that frequency.
+    """
+
+    epsilon = 1e-9
+
+    def __init__(self, omega: float):
+        level_weights = (1.0, 1.0 / omega, 1.0 / omega**2)
+        self.weights = np.array([w for w in level_weights for _ in range(OUTPUT_DIM)])
+
+    def distance(self, a: np.ndarray, b: np.ndarray) -> float:
+        delta = (np.asarray(a, dtype=float) - np.asarray(b, dtype=float)) * self.weights
+        return math.sqrt(float(delta @ delta))
+
+    def nearest(self, states: np.ndarray, target: np.ndarray) -> int:
+        delta = (states - target) * self.weights
+        return int(np.argmin((delta * delta).sum(axis=1)))
+
+
+class _OptimalDuration:
+    """The minimum-effort duration of the edge from a node to the target.
+
+    Steering toward a state that is far away in metres but already moving the right way
+    comes out cheap, and that is precisely the information a fixed-weight Euclidean
+    distance discards. Not a metric in the strict sense -- it is asymmetric and does not
+    satisfy the triangle inequality -- but nearest-neighbour search only needs a
+    consistent ordering.
+
+    Every node in the tree needs its own root solve, so this costs one to two orders of
+    magnitude more per query than the Euclidean form. That is the price of the ordering,
+    and it is why the two are selectable rather than one replacing the other.
+    """
+
+    def __init__(self, steering: "MinimumEffortSteering"):
+        self.steering = steering
+        # The batch solve cannot report anything below its own floor, so the "these are the
+        # same state" threshold has to sit just above it rather than at the Euclidean
+        # scale -- otherwise a coincident pair reads as a small-but-real 10 ms edge and the
+        # coincidence guards never fire.
+        self.epsilon = 1.5 * float(steering.min_duration)
+
+    @staticmethod
+    def _rows(state: np.ndarray) -> np.ndarray:
+        return np.asarray(state, dtype=float).reshape(3, OUTPUT_DIM)
+
+    def distance(self, a: np.ndarray, b: np.ndarray) -> float:
+        target = np.asarray(b, dtype=float).reshape(1, N_STATES)
+        return float(self.steering.optimal_duration_batch(self._rows(a), target)[0])
+
+    def nearest(self, states: np.ndarray, target: np.ndarray) -> int:
+        # node -> target, the direction the edge would actually be flown, matching
+        # `distance`. Ranking by the reverse is cheaper -- it batches the tree as the list
+        # of targets for one fixed origin -- but it is a different ordering, because the
+        # duration is not symmetric: a node already moving toward the target is quick to
+        # reach it and slow to be reached from it.
+        count = states.shape[0]
+        froms = states.reshape(count, ORDER, OUTPUT_DIM)
+        targets = np.broadcast_to(
+            np.asarray(target, dtype=float).reshape(ORDER, OUTPUT_DIM),
+            (count, ORDER, OUTPUT_DIM),
+        )
+        durations = self.steering.durations_between(froms, targets)
+        return int(np.argmin(durations))
+
+
 class _Tree:
     def __init__(self, root: np.ndarray):
         self.states = np.asarray(root, dtype=float).reshape(1, N_STATES)
         self.parents: List[int] = [-1]
         self.motions: List[Optional[FlatMotion]] = [None]
+        # Dynamic-domain radius per node, in the units of the active metric. Infinite means
+        # "no restriction": the roots keep it forever, and so does every node that has not
+        # yet had an extension refused.
+        self.radii: List[float] = [math.inf]
 
     def __len__(self) -> int:
         return self.states.shape[0]
@@ -1061,11 +1329,11 @@ class _Tree:
         self.states = np.vstack([self.states, np.asarray(state, dtype=float).reshape(1, N_STATES)])
         self.parents.append(parent)
         self.motions.append(motion)
+        self.radii.append(math.inf)
         return self.last
 
-    def nearest(self, target: np.ndarray, weights: np.ndarray) -> int:
-        delta = (self.states - target) * weights
-        return int(np.argmin(np.einsum("ij,ij->i", delta, delta)))
+    def nearest(self, target: np.ndarray, metric) -> int:
+        return metric.nearest(self.states, target)
 
 
 @dataclass
@@ -1105,6 +1373,10 @@ class RRTResult:
     duration: float
     success: bool
     seed: int
+    # The search trees, handed over for `plot_trees`. None only when planning never started
+    # because an endpoint state was invalid.
+    start_tree: Optional[_Tree] = None
+    goal_tree: Optional[_Tree] = None
 
 
 class KinodynamicRRTConnect:
@@ -1123,22 +1395,46 @@ class KinodynamicRRTConnect:
         self.rng = rng if rng is not None else np.random.default_rng(params.rrt_seed)
         self.checker = FlatEdgeChecker(params, mobility)
 
-        omega = float(params.rrt_metric_omega)
-        level_weights = (1.0, 1.0 / omega, 1.0 / omega**2)
-        self.weights = np.array([w for w in level_weights for _ in range(OUTPUT_DIM)])
+        self.metric = make_metric(params, steering)
+        # Extension step, in seconds of flight (see `_steer`). Intermediate states subdivide
+        # each accepted extension at this spacing; 0 keeps one node per extension.
         self.max_step = float(params.rrt_max_step)
+        self.intermediate_dt = float(getattr(params, "rrt_intermediate_dt", 0.0))
         self.retry_steps = max(1, int(params.rrt_retry_steps))
         # A bound-aware steerer has already rejected anything that leaves the limits, so
         # re-testing every accepted edge would just redo its work.
         self.bounds_guaranteed = getattr(steering, "limits", None) is not None
-        self.metric_eps = 1e-9
+        self.metric_eps = self.metric.epsilon
+
+        # Which tree takes the random sample each iteration. "larger" (the pre-existing
+        # behaviour, and by measurement much the strongest of the three on this planner:
+        # on the sanity suite's wall scenario it solves in 377 nodes where the reference's
+        # ratio rule needs 1998 and strict alternation does not solve at all) grows the
+        # bigger tree toward the sample and leaves the greedy CONNECT walk to the smaller
+        # one. "ratio" is VAMP-RRTC's balance rule, "alternate" is a swap every iteration.
+        self.tree_selection = str(getattr(params, "rrt_tree_selection", "larger")).lower()
+        self.tree_ratio = float(getattr(params, "rrt_tree_ratio", 1.0))
+        self.dynamic_domain = bool(getattr(params, "rrt_dynamic_domain", False))
+        self.dd_alpha = float(getattr(params, "rrt_dd_alpha", 1e-4))
+        # The domain radii are quoted as multiples of the step. That was unit-consistent when
+        # the step was a metric distance; now that the step is a flight time, the radius is
+        # only in the metric's units under the duration metric -- under the Euclidean one the
+        # two sides of the comparison are metres against seconds, and the radius should be
+        # set explicitly if the two are ever enabled together. VAMP's own defaults are
+        # radius = 2x range and min_radius = 0.5x range.
+        self.dd_radius = float(getattr(params, "rrt_dd_radius", 2.0)) * self.max_step
+        self.dd_min_radius = float(getattr(params, "rrt_dd_min_radius", 0.5)) * self.max_step
         self.explored_nodes: List[List[float]] = []
         self.explored_nodes_3d: List[List[float]] = []
+        # Live references to the trees the search grows, kept after `plan` returns so a
+        # finished search can be plotted -- including a failed one, where the tree shape is
+        # the whole point of looking.
+        self.start_tree: Optional[_Tree] = None
+        self.goal_tree: Optional[_Tree] = None
 
     # -- helpers -----------------------------------------------------------------------
     def _metric(self, a: np.ndarray, b: np.ndarray) -> float:
-        delta = (np.asarray(a, dtype=float) - np.asarray(b, dtype=float)) * self.weights
-        return float(np.linalg.norm(delta))
+        return self.metric.distance(a, b)
 
     def _sample(self, start: np.ndarray, goal: np.ndarray) -> np.ndarray:
         params = self.params
@@ -1174,7 +1470,17 @@ class KinodynamicRRTConnect:
         return state
 
     def _steer(self, near: np.ndarray, target: np.ndarray, step: float):
-        """Steer toward ``target``, stopping after roughly ``step`` of metric distance.
+        """Steer toward ``target``, stopping after ``step`` seconds of the motion.
+
+        The step is a flight time, not a metric distance: the duration a minimum-effort
+        quintic takes is only a cube-root function of the distance it covers, so a metric
+        step bought a varying amount of motion, and the stop state it produced carried the
+        trajectory's velocity and acceleration -- which could leave it *farther* from the
+        target than the node it grew from (measured on 299 of 301 walk extensions). In time,
+        one step is a fixed slice of the motion itself. That is a cleaner step, not a cure
+        for the walk: a step whose stop state is not the tree's new nearest still gets
+        re-derived from the same parent, and the duplicates that produces are a property of
+        the walk, not of the step's units.
 
         Returns a motion already checked against the obstacles and the state/input limits, so
         the caller only has to add it. For a step-limited move the stop state is read off the
@@ -1188,15 +1494,13 @@ class KinodynamicRRTConnect:
         if motion is None:
             return None, None, False
 
-        distance = self._metric(near, target)
-        if distance <= step:
+        if motion.duration <= step:
             if self._is_valid(motion):
                 return motion, np.asarray(target, dtype=float).copy(), True
             return None, None, False
 
-        fraction = step / distance
-        waypoint = motion.flat_state(fraction * motion.duration)
-        prefix = motion.truncated(fraction * motion.duration)
+        waypoint = motion.flat_state(step)
+        prefix = motion.truncated(step)
         if self._is_valid(prefix):
             return prefix, waypoint, False
 
@@ -1204,11 +1508,12 @@ class KinodynamicRRTConnect:
         if edge is not None and self._is_valid(edge):
             return edge, waypoint, False
 
-        # Last resort: a step-limited target interpolated in flat-state space. The two attempts
-        # above inherit the shape of the motion to `target`, which is badly matched when the
-        # steerer's duration does not scale with distance (as with fixed-duration steering);
-        # blending the whole state gives that steerer a short, gentle target instead.
-        blended = near + fraction * (target - near)
+        # Last resort: a target interpolated in flat-state space by the same fraction of the
+        # motion. The two attempts above inherit the shape of the motion to `target`, which is
+        # badly matched when the steerer's duration does not scale with distance (as with
+        # fixed-duration steering); blending the whole state gives that steerer a short,
+        # gentle target instead.
+        blended = near + (step / motion.duration) * (target - near)
         edge = self.steering.steer(near, blended)
         if edge is not None and self._is_valid(edge):
             return edge, blended, False
@@ -1226,7 +1531,7 @@ class KinodynamicRRTConnect:
         self.explored_nodes.append([float(state[0]), float(state[1])])
         self.explored_nodes_3d.append([float(state[0]), float(state[1]), float(state[2])])
 
-    def _grow(self, tree: _Tree, target: np.ndarray) -> int:
+    def _grow(self, tree: _Tree, target: np.ndarray, apply_domain: bool = True) -> int:
         """Extend the tree toward ``target``, shortening the step on rejection.
 
         A rejected edge usually means the quintic's interior excursion broke a state or input
@@ -1234,21 +1539,76 @@ class KinodynamicRRTConnect:
         jerk. Halving the step and retrying converts most of those into shorter valid edges
         instead of dropping them, which matters most where the payload's z-slab is only
         ``state_max[2] - state_min[2]`` tall and any dip below ``state_min[2]`` is fatal.
+
+        ``apply_domain`` gates VAMP's dynamic domain. Its radius bookkeeping rides on the
+        main extension only; the CONNECT walk toward an already-reached node is exempt, as
+        it is in the reference.
         """
-        parent = tree.nearest(target, self.weights)
+        parent = tree.nearest(target, self.metric)
         near = tree.states[parent]
-        if self._metric(near, target) < self.metric_eps:
+        distance = self._metric(near, target)
+        if distance < self.metric_eps:
             return TRAPPED
+
+        # Dynamic domain: a sample landing outside the nearest node's radius is dropped
+        # before anything is steered. That is the whole saving -- the node is failing in
+        # the same direction over and over, and re-solving the boundary value problem is
+        # what costs. The radius shrinks on refusal and grows on success, so a node in a
+        # dead end stops attracting samples while one that keeps working takes a wider
+        # share of them.
+        if self.dynamic_domain and apply_domain and tree.radii[parent] < distance:
+            return REJECTED
 
         step = self.max_step
         for _ in range(self.retry_steps):
-            motion, new_state, reached = self._steer(near, target, step)
+            motion, _, reached = self._steer(near, target, step)
             if motion is not None:
-                tree.add(new_state, parent, motion)
-                self._record(new_state)
+                if self.dynamic_domain and tree.radii[parent] != math.inf:
+                    tree.radii[parent] *= 1.0 + self.dd_alpha
+                self._extend(tree, parent, motion)
                 return REACHED if reached else ADVANCED
             step *= 0.5
+
+        if self.dynamic_domain and apply_domain:
+            if tree.radii[parent] == math.inf:
+                tree.radii[parent] = self.dd_radius
+            else:
+                tree.radii[parent] = max(
+                    tree.radii[parent] * (1.0 - self.dd_alpha), self.dd_min_radius
+                )
         return TRAPPED
+
+    def _extend(self, tree: _Tree, parent: int, motion: FlatMotion) -> None:
+        """Add ``motion`` to ``tree``, as a chain of nodes when intermediate states are on.
+
+        This is OMPL's control-RRT ``intermediate_states`` option: the extension is walked
+        state by state and every state spaced ``rrt_intermediate_dt`` apart joins the tree,
+        so nearest-neighbour queries resolve at that spacing instead of at one node per
+        extension -- which is what lets a greedy CONNECT walk keep advancing through a
+        narrow region instead of stopping at the first node that does not help.
+
+        Each node stores the *piece* of the motion arriving at it, so the chain concatenates
+        back to exactly the edge the steerer validated; the parent of every node is the node
+        before it, as in the reference.
+        """
+        spacing = self.intermediate_dt
+        end = motion.duration
+        start = 0.0
+        node = parent
+        if spacing > 0.0:
+            for stop in np.arange(spacing, end, spacing):
+                node = self._append(tree, node, motion, start, float(stop))
+                start = float(stop)
+        self._append(tree, node, motion, start, end)
+
+    def _append(
+        self, tree: _Tree, parent: int, motion: FlatMotion, start: float, end: float
+    ) -> int:
+        piece = motion if start == 0.0 and end >= motion.duration else motion.slice(start, end)
+        state = piece.flat_state(piece.duration)
+        tree.add(state, parent, piece)
+        self._record(state)
+        return tree.last
 
     # -- main loop ---------------------------------------------------------------------
     def plan(self, start: np.ndarray, goal: np.ndarray) -> Optional[FlatPath]:
@@ -1257,48 +1617,64 @@ class KinodynamicRRTConnect:
 
         start_tree = _Tree(start)
         goal_tree = _Tree(goal)
+        self.start_tree, self.goal_tree = start_tree, goal_tree
         self._record(start)
         self._record(goal)
 
         deadline = time.monotonic() + float(self.params.rrt_timeout)
         connect_limit = 100
 
+        # Seeded the way the reference does it: `tree_a` starts as the *goal* tree so that
+        # the first iteration's balance swap hands it to the start tree.
+        tree_a, tree_b = goal_tree, start_tree
+        tree_a_is_start = False
+
         for _ in range(int(self.params.rrt_max_iterations)):
             if time.monotonic() > deadline:
                 break
 
-            if len(goal_tree) < len(start_tree):
-                tree, other, other_is_goal = start_tree, goal_tree, True
+            # Which tree gets the random sample, and which gets the greedy CONNECT walk.
+            # See `tree_selection` for why "larger" is the default rather than the balance
+            # rule from the reference.
+            asize = len(tree_a)
+            if self.tree_selection == "alternate":
+                swap = True
+            elif self.tree_selection == "ratio":
+                swap = abs(asize - len(tree_b)) / asize < self.tree_ratio
             else:
-                tree, other, other_is_goal = goal_tree, start_tree, False
+                swap = asize < len(tree_b)
+            if swap:
+                tree_a, tree_b = tree_b, tree_a
+                tree_a_is_start = not tree_a_is_start
 
-            if self._grow(tree, self._sample(start, goal)) == TRAPPED:
+            status = self._grow(tree_a, self._sample(start, goal))
+            if status == TRAPPED or status == REJECTED:
                 continue
 
-            target = tree.states[tree.last]
+            target = tree_a.states[tree_a.last]
             joined = None
-            if self._metric(target, other.states[0]) < self.metric_eps:
+            if self._metric(target, tree_b.states[0]) < self.metric_eps:
                 # The extension landed exactly on the other tree's root, so the trees are
                 # already joined. CONNECT would only see a zero-length target and report
                 # TRAPPED, which used to discard a perfectly good direct connection.
                 joined = 0
             else:
                 for _ in range(connect_limit):
-                    status = self._grow(other, target)
+                    status = self._grow(tree_b, target, apply_domain=False)
                     if status == TRAPPED:
                         break
                     if status == REACHED:
-                        joined = other.last
+                        joined = tree_b.last
                         break
             if joined is None:
                 continue
 
             # `joined` indexes whichever tree CONNECT grew, which is the goal tree when the
             # start tree was the one just extended, and vice versa.
-            if other_is_goal:
-                path = self._extract(start_tree, tree.last, goal_tree, joined, self.steering)
+            if tree_a_is_start:
+                path = self._extract(start_tree, tree_a.last, goal_tree, joined, self.steering)
             else:
-                path = self._extract(start_tree, joined, goal_tree, tree.last, self.steering)
+                path = self._extract(start_tree, joined, goal_tree, tree_a.last, self.steering)
             if path is not None:
                 return path
             # The junction was reached on the goal side but the edges cannot be re-solved
@@ -1471,6 +1847,27 @@ def path_to_sol_values(path: FlatPath, params, dt: Optional[float] = None) -> di
     return {"x": x, "u": u, "t": t}
 
 
+def make_metric(params, steering: FlatSteering) -> object:
+    """Nearest-neighbour distance for the search, per ``rrt_metric``.
+
+    ``euclidean`` weights velocity and acceleration errors against position. ``duration``
+    ranks by the minimum-effort duration of the edge a node would actually fly, which
+    prices "already moving the right way". Neither is tied to the step limit any more --
+    the extension step is a flight time under both.
+    """
+    kind = str(getattr(params, "rrt_metric", "euclidean")).lower()
+    if kind == "euclidean":
+        return _WeightedEuclidean(float(getattr(params, "rrt_metric_omega", 2.0)))
+    if kind == "duration":
+        if not isinstance(steering, MinimumEffortSteering):
+            raise ValueError(
+                "rrt_metric 'duration' requires rrt_steering 'minimum_effort'; the fixed "
+                "steerer has no duration to rank by"
+            )
+        return _OptimalDuration(steering)
+    raise ValueError(f"unknown rrt_metric {kind!r}; expected 'euclidean' or 'duration'")
+
+
 def make_steering(params) -> FlatSteering:
     kind = getattr(params, "rrt_steering", "minimum_effort")
     limits = None
@@ -1520,55 +1917,147 @@ def solve_with_rrt(
         duration=time.monotonic() - started,
         success=path is not None,
         seed=int(params.rrt_seed),
+        start_tree=planner.start_tree,
+        goal_tree=planner.goal_tree,
     )
     if show_animation:  # pragma: no cover - interactive only
-        _animate(params, result)
+        plot_trees(params, result)
     return result
 
 
-def _animate(params, result: RRTResult) -> None:  # pragma: no cover - interactive only
-    import matplotlib.pyplot as plt  # lazy: the repo forces TkAgg at import time
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+# Tree edges are drawn as polylines; sampling each one at this rate in time is plenty to
+# read the shape of a quintic without bloating the artist.
+TREE_EDGE_SAMPLES_PER_SECOND = 20.0
+TREE_EDGE_MAX_SAMPLES = 40
 
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection="3d")
+
+def _edge_polylines(tree: _Tree) -> np.ndarray:
+    """NaN-separated 3-D payload positions along every edge of ``tree``.
+
+    Positions only -- the derivatives are not part of this view. The whole tree becomes one
+    plotting call rather than one artist per edge: a few thousand ``Line3D`` objects make
+    matplotlib crawl, while NaN separators are free.
+    """
+    segments: List[np.ndarray] = []
+    for index in range(1, len(tree)):
+        motion = tree.motions[index]
+        if motion is None:  # pragma: no cover - only the root has no incoming motion
+            continue
+        samples = max(
+            2,
+            min(
+                TREE_EDGE_MAX_SAMPLES,
+                int(math.ceil(motion.duration * TREE_EDGE_SAMPLES_PER_SECOND)),
+            ),
+        )
+        segments.append(motion.samples_at(np.linspace(0.0, motion.duration, samples), 0))
+        segments.append(np.full((1, OUTPUT_DIM), np.nan))
+    return np.vstack(segments) if segments else np.empty((0, OUTPUT_DIM))
+
+
+# The 12 edges of a box, as index pairs into the vertex list built in `_draw_obstacles`.
+_BOX_EDGES = (
+    (0, 1), (1, 2), (2, 3), (3, 0),  # bottom face
+    (4, 5), (5, 6), (6, 7), (7, 4),  # top face
+    (0, 4), (1, 5), (2, 6), (3, 7),  # verticals
+)
+
+
+def _draw_obstacles(ax, params) -> None:
+    """Obstacle boxes as wireframes.
+
+    Wireframe rather than the filled faces ``poly_fly.utils.plot`` uses: six translucent
+    faces per box, with several boxes stacked along the view ray, add up to an opaque one
+    that swallows any tree behind it -- and mplot3d sorts a whole NaN-joined polyline by a
+    single depth, so an entire tree can end up behind them. A tree you cannot see is no use
+    in a debug view; the box edges still show where the walls are.
+    """
+    segments: List[np.ndarray] = []
     for key in params.obstacles.keys():
         obs = params.obstacles[key]
         x, y, z = obs["x"], obs["y"], obs["z"]
         l, b, h = obs["l"], obs["b"], obs["h"]
-        corners = np.array(
+        vertices = np.array(
             [
-                [x + sx * l / 2, y + sy * b / 2, z + sz * h / 2]
-                for sx in (-1, 1)
-                for sy in (-1, 1)
-                for sz in (-1, 1)
+                [x - l / 2, y - b / 2, z - h / 2],
+                [x - l / 2, y + b / 2, z - h / 2],
+                [x + l / 2, y + b / 2, z - h / 2],
+                [x + l / 2, y - b / 2, z - h / 2],
+                [x - l / 2, y - b / 2, z + h / 2],
+                [x - l / 2, y + b / 2, z + h / 2],
+                [x + l / 2, y + b / 2, z + h / 2],
+                [x + l / 2, y - b / 2, z + h / 2],
             ]
         )
-        from scipy.spatial import ConvexHull
+        for a, c in _BOX_EDGES:
+            segments.append(vertices[[a, c]])
+            segments.append(np.full((1, OUTPUT_DIM), np.nan))
+    if not segments:
+        return
+    edges = np.vstack(segments)
+    ax.plot(edges[:, 0], edges[:, 1], edges[:, 2], color="gray", lw=0.8, label="obstacles")
 
-        for simplex in ConvexHull(corners).simplices:
-            ax.add_collection3d(
-                Poly3DCollection([corners[simplex]], alpha=0.4, facecolors="darkgray")
-            )
 
-    nodes = np.asarray(result.explored_nodes_3d, dtype=float).reshape(-1, 3)
-    if nodes.size:
-        ax.scatter(nodes[:, 0], nodes[:, 1], nodes[:, 2], s=2, c="c", label="explored")
+def plot_trees(params, result: RRTResult) -> None:  # pragma: no cover - interactive only
+    """Debug view of the search in 3D: both trees, the obstacle set and the solution path.
+
+    Every edge is drawn as the payload trajectory it actually is -- the stored motion
+    sampled in time -- so a badly shaped quintic shows up as one, instead of being hidden
+    by the straight chord that a node-only scatter would suggest. Start and goal trees get
+    distinct colours; the solution path is overlaid in black. Also worth opening when the
+    search *failed*: the trees are exactly what it managed to explore.
+    """
+    import matplotlib.pyplot as plt  # lazy: the repo forces TkAgg at import time
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection="3d")
+    _draw_obstacles(ax, params)
+
+    for tree, color, label in (
+        (result.start_tree, "tab:blue", "start tree"),
+        (result.goal_tree, "tab:orange", "goal tree"),
+    ):
+        if tree is None or len(tree) < 2:
+            continue
+        edges = _edge_polylines(tree)
+        ax.plot(edges[:, 0], edges[:, 1], edges[:, 2], color=color, lw=0.6, alpha=0.5, label=label)
+        nodes = tree.states[1:, :3]
+        ax.scatter(
+            nodes[:, 0], nodes[:, 1], nodes[:, 2], s=2, color=color, label=label + " nodes"
+        )
+
+    if result.start_tree is not None:
+        start = result.start_tree.states[0]
+        ax.scatter(*start[:3], s=60, marker="o", color="green", label="start", depthshade=False)
+    if result.goal_tree is not None:
+        goal = result.goal_tree.states[0]
+        ax.scatter(*goal[:3], s=90, marker="*", color="red", label="goal", depthshade=False)
+
     if result.success:
-        times = np.linspace(0.0, result.path.duration(), 200)
-        pts = result.path.samples_at(times, 0)
-        ax.plot(pts[:, 0], pts[:, 1], pts[:, 2], "-r", label="RRT path")
+        times = np.linspace(0.0, result.path.duration(), 400)
+        points = result.path.samples_at(times, 0)
+        ax.plot(points[:, 0], points[:, 1], points[:, 2], color="black", lw=2.0, label="solution")
+
+    state_min = np.asarray(params.state_min, dtype=float)[:3]
+    state_max = np.asarray(params.state_max, dtype=float)[:3]
+    ax.set_box_aspect(np.maximum(state_max - state_min, 1e-3))  # keep the scene un-squashed
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_zlabel("z")
-    ax.legend()
+    start_nodes = 0 if result.start_tree is None else len(result.start_tree)
+    goal_nodes = 0 if result.goal_tree is None else len(result.goal_tree)
+    ax.set_title(
+        "RRT-Connect %s -- %d start / %d goal nodes, %d iterations"
+        % ("solved" if result.success else "failed", start_nodes, goal_nodes, result.iterations)
+    )
+    ax.legend(loc="upper left", fontsize="small")
     plt.show()
 
 
 def main() -> None:  # pragma: no cover - CLI
     parser = argparse.ArgumentParser(description="Kinodynamic RRT-Connect (no optimization)")
     parser.add_argument("--yaml", type=str, required=True, help="path relative to data/params")
-    parser.add_argument("--plot", action="store_true", help="animate the search and path")
+    parser.add_argument("--plot", action="store_true", help="plot the search trees and the path")
     parser.add_argument("--save", action="store_true", help="write the trajectory CSV")
     args = parser.parse_args()
 
