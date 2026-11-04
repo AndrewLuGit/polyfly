@@ -1,0 +1,5 @@
+[
+ {"name": "pos3_shortcut", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 3, "kpiece_expansion": "global", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false}},
+ {"name": "pacc4_shortcut", "overrides": {"kpiece_projection": "position_acceleration", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false}},
+ {"name": "adapt_shortcut", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false, "kpiece_adaptive": true, "kpiece_calibration_iters": 1500, "kpiece_calibration_rounds": 3}}
+]

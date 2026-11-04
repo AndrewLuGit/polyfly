@@ -1,0 +1,5 @@
+[
+ {"name": "global_nodist", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false, "kpiece_cell_score_distance": false}},
+ {"name": "geom_nodist", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 4, "kpiece_expansion": "geometric", "kpiece_local_dims": "full", "kpiece_local_radius_cells": 3.0, "kpiece_connection": "steer", "kpiece_cell_envelope": false, "kpiece_cell_score_distance": false}},
+ {"name": "ctrl_nodist", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 4, "kpiece_expansion": "control", "kpiece_control_fraction": 0.5, "kpiece_connection": "steer", "kpiece_cell_envelope": false, "kpiece_cell_score_distance": false}}
+]

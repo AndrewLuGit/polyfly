@@ -1,0 +1,3 @@
+[
+ {"name": "ocp", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "ocp", "kpiece_cell_envelope": false, "kpiece_ocp_max_attempts": 1, "kpiece_ocp_max_jump": 0.8}}
+]

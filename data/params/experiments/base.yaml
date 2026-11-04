@@ -213,3 +213,55 @@ rrt_sample_inset: 0.0
 rrt_seed: 0
 rrt_csv_dt: 0.02
 rrt_csv_subdir: "rrt"
+
+# --- Bidirectional KPIECE ---------------------------------------------------------------------
+# The planner lives in bidirectional_kpiece.py and is run standalone or through
+# tests/bench_kpiece.py. It reuses the rrt_* steering, metric, sampling envelope, collision and
+# shortcut knobs above; only the discretization/expansion/junction/calibration knobs are here.
+# The experiments compare:
+#   * projection: position | position_velocity | full (plus position_acceleration, metric_full)
+#   * expansion:  geometric (local-ball sample + steer) | control (random jerk + propagate)
+#   * cell score: BKPIECE's no-distance score (false) vs. dividing by distance to the other root
+#   * connection: steer | shortcut | ocp (increasing cost)
+# The defaults below are the BKPIECE-faithful, non-greedy starting point used by the screen.
+kpiece_projection: "position_velocity"
+kpiece_projection_dims: null
+kpiece_cells_per_dim: 8
+kpiece_cell_sizes: null
+# Initial velocity/acceleration cell sizes from the rrt_sample_* envelope. Off by default:
+# a smoke test on maze_1 showed the envelope-scale cells (~0.025 m/s) fragment the grid so
+# finely that the two trees never share a cell; full-range cells (8 per dimension) meet and
+# solve the maze. The paper's calibration can recover a finer grid when it is justified.
+kpiece_cell_envelope: false
+kpiece_cell_factor: 2.0
+kpiece_expansion: "global"
+kpiece_local_radius: null
+kpiece_local_radius_cells: 2.0
+kpiece_local_dims: "projection"
+kpiece_control_fraction: 1.0
+kpiece_cell_score_distance: false
+kpiece_tree_selection: "alternate"
+# Motion selection within a cell. "half_normal" is OMPL's RNG::halfNormalInt: the index is
+# biased toward the newest motion (cell motion lists are append-ordered), so frontier/recent
+# extensions are preferred. "uniform" is the A/B baseline.
+kpiece_motion_selection: "half_normal"
+kpiece_halfnormal_focus: 3.0
+# Junction node selection from the other tree. "uniform" samples the other cell's motions
+# uniformly; "closest" picks the nearest endpoint (the old behavior, kept for A/B).
+kpiece_junction_selection: "uniform"
+kpiece_border_fraction: 0.8
+kpiece_good_score_factor: 0.9
+kpiece_bad_score_factor: 0.45
+kpiece_interesting_probability: 0.05
+kpiece_min_steps: 1
+kpiece_max_steps: 20
+kpiece_connect_tries: 2
+kpiece_connection: "steer"
+kpiece_shortcut_candidates: 5
+kpiece_ocp_max_attempts: 2
+kpiece_ocp_max_jump: 1.0
+kpiece_junction_attempts: 3
+kpiece_adaptive: false
+kpiece_calibration_iters: 2000
+kpiece_calibration_rounds: 3
+kpiece_interior_rule_max_dim: 6

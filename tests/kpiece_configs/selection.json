@@ -1,0 +1,6 @@
+[
+ {"name": "uniform_closest", "overrides": {"kpiece_projection": "position_acceleration", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false, "kpiece_motion_selection": "uniform", "kpiece_junction_selection": "closest"}},
+ {"name": "halfnormal_closest", "overrides": {"kpiece_projection": "position_acceleration", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false, "kpiece_motion_selection": "half_normal", "kpiece_junction_selection": "closest"}},
+ {"name": "uniform_uniform", "overrides": {"kpiece_projection": "position_acceleration", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false, "kpiece_motion_selection": "uniform", "kpiece_junction_selection": "uniform"}},
+ {"name": "both", "overrides": {"kpiece_projection": "position_acceleration", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false, "kpiece_motion_selection": "half_normal", "kpiece_junction_selection": "uniform"}}
+]

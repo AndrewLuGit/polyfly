@@ -1,0 +1,6 @@
+[
+ {"name": "pacc_adapt", "overrides": {"margin": 0.0, "kpiece_projection": "position_acceleration", "kpiece_cell_sizes": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5], "kpiece_expansion": "control", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false, "kpiece_adaptive": true, "kpiece_calibration_iters": 2000, "kpiece_calibration_rounds": 3}},
+ {"name": "pacc_nonadapt", "overrides": {"margin": 0.0, "kpiece_projection": "position_acceleration", "kpiece_cell_sizes": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5], "kpiece_expansion": "control", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false}},
+ {"name": "pacc_smallcells", "overrides": {"margin": 0.0, "kpiece_projection": "position_acceleration", "kpiece_cell_sizes": [0.25, 0.25, 0.25, 0.5, 0.5, 0.5], "kpiece_expansion": "control", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false}},
+ {"name": "pacc_largecells", "overrides": {"margin": 0.0, "kpiece_projection": "position_acceleration", "kpiece_cell_sizes": [1.0, 1.0, 1.0, 0.5, 0.5, 0.5], "kpiece_expansion": "control", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false}}
+]

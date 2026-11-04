@@ -9,6 +9,7 @@ import sys
 from casadi import MX
 import casadi as ca
 from dataclasses import dataclass, field
+from typing import Optional
 from scipy.spatial.transform import Rotation as Rot
 
 
@@ -81,6 +82,45 @@ class MPC:
     rrt_seed: int = 0
     rrt_csv_dt: float = 0.02
     rrt_csv_subdir: str = "rrt"
+    # Bidirectional KPIECE (`bidirectional_kpiece.py`). Shared search knobs reuse the rrt_*
+    # fields; these only control the discretization, expansion, junction and calibration.
+    # List-valued fields use None rather than a dataclass factory because dictToClass reads
+    # the signature default directly.
+    kpiece_projection: str = "position_velocity"
+    kpiece_projection_dims: Optional[list] = None
+    kpiece_cells_per_dim: int = 8
+    kpiece_cell_sizes: Optional[list] = None
+    kpiece_cell_envelope: bool = False
+    kpiece_expansion: str = "global"  # geometric | control | global
+    kpiece_local_radius: Optional[float] = None
+    kpiece_local_radius_cells: float = 2.0
+    kpiece_local_dims: str = "projection"  # projection | full
+    kpiece_control_fraction: float = 1.0
+    kpiece_cell_score_distance: bool = False
+    kpiece_tree_selection: str = "alternate"
+    # KPIECE motion selection inside a cell: OMPL's half-normal index is biased toward the
+    # newest motion (the list is append-ordered); uniform is the comparison baseline.
+    kpiece_motion_selection: str = "half_normal"
+    kpiece_halfnormal_focus: float = 3.0
+    # Junction node selection from the other tree: uniform random (requested) or closest.
+    kpiece_junction_selection: str = "uniform"
+    kpiece_border_fraction: float = 0.8
+    kpiece_good_score_factor: float = 0.9
+    kpiece_bad_score_factor: float = 0.45
+    kpiece_interesting_probability: float = 0.05
+    kpiece_min_steps: int = 1
+    kpiece_max_steps: int = 20
+    kpiece_connect_tries: int = 2
+    kpiece_connection: str = "steer"  # steer | shortcut | ocp
+    kpiece_shortcut_candidates: int = 5
+    kpiece_ocp_max_attempts: int = 2
+    kpiece_ocp_max_jump: float = 1.0
+    kpiece_junction_attempts: int = 3
+    kpiece_adaptive: bool = False
+    kpiece_calibration_iters: int = 2000
+    kpiece_calibration_rounds: int = 3
+    kpiece_cell_factor: float = 2.0
+    kpiece_interior_rule_max_dim: int = 6
 
 
 def dictToClass(clss, data):

@@ -1,0 +1,13 @@
+[
+ {"name": "pos2", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 2, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false}},
+ {"name": "pos3", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 3, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false}},
+ {"name": "pos4", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false}},
+ {"name": "pos6", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 6, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false}},
+ {"name": "pos8", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 8, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false}},
+ {"name": "pv4", "overrides": {"kpiece_projection": "position_velocity", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false}},
+ {"name": "pv8", "overrides": {"kpiece_projection": "position_velocity", "kpiece_cells_per_dim": 8, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false}},
+ {"name": "full4", "overrides": {"kpiece_projection": "full", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false}},
+ {"name": "pacc4", "overrides": {"kpiece_projection": "position_acceleration", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false}},
+ {"name": "metric4", "overrides": {"kpiece_projection": "metric_full", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false}},
+ {"name": "adapt_pos", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false, "kpiece_adaptive": true, "kpiece_calibration_iters": 1500, "kpiece_calibration_rounds": 3}}
+]

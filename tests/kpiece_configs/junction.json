@@ -1,0 +1,4 @@
+[
+ {"name": "steer", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "steer", "kpiece_cell_envelope": false}},
+ {"name": "shortcut", "overrides": {"kpiece_projection": "position", "kpiece_cells_per_dim": 4, "kpiece_expansion": "global", "kpiece_connection": "shortcut", "kpiece_cell_envelope": false}}
+]
